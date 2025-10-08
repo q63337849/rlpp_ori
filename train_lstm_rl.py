@@ -50,11 +50,7 @@ class ProgressiveConfig:
                 'eval_frequency': 20,
                 'min_success': 0.5,
                 'extra_episodes': 120,
-                'max_repeats': 3,
-                'batch_size': 512,
-                'mini_batch': 128,
-                'update_epochs': 4,
-                'gae_lambda': 0.95
+                'max_repeats': 3
             },
             {
                 'name': '阶段2：简单动态',
@@ -64,11 +60,7 @@ class ProgressiveConfig:
                 'eval_frequency': 20,
                 'min_success': 0.3,
                 'extra_episodes': 80,
-                'max_repeats': 3,
-                'batch_size': 384,
-                'mini_batch': 96,
-                'update_epochs': 4,
-                'gae_lambda': 0.95
+                'max_repeats': 3
             },
             {
                 'name': '阶段3：复杂动态',
@@ -78,11 +70,7 @@ class ProgressiveConfig:
                 'eval_frequency': 20,
                 'min_success': 0.2,
                 'extra_episodes': 80,
-                'max_repeats': 4,
-                'batch_size': 384,
-                'mini_batch': 96,
-                'update_epochs': 5,
-                'gae_lambda': 0.92
+                'max_repeats': 4
             },
             {
                 'name': '阶段4：混乱模式',
@@ -92,11 +80,7 @@ class ProgressiveConfig:
                 'eval_frequency': 20,
                 'min_success': 0.1,
                 'extra_episodes': 100,
-                'max_repeats': 4,
-                'batch_size': 384,
-                'mini_batch': 96,
-                'update_epochs': 5,
-                'gae_lambda': 0.9
+                'max_repeats': 4
             }
         ]
 
@@ -246,6 +230,32 @@ class SimpleAgent:
 
         return actor_loss, critic_loss
 
+    @staticmethod
+    def clone_state(lstm_state):
+        """复制LSTM状态，避免被环境后续修改"""
+        return {
+            'self_state': np.array(lstm_state['self_state'], dtype=np.float32, copy=True),
+            'goal_state': np.array(lstm_state['goal_state'], dtype=np.float32, copy=True),
+            'obstacle_states': np.array(lstm_state['obstacle_states'], dtype=np.float32, copy=True)
+        }
+
+    def td_update(self, state, action, reward, next_state, done, learning_rate, gamma):
+        """基于单步TD误差的更新，更接近原AC训练流程"""
+        cloned_state = self.clone_state(state)
+        cloned_next_state = self.clone_state(next_state)
+
+        current_value = self.get_value(cloned_state)
+        next_value = 0.0 if done else self.get_value(cloned_next_state)
+
+        target = reward + gamma * next_value
+        advantage = target - current_value
+
+        actor_loss, critic_loss = self.train_step(
+            [cloned_state], [action], [advantage], [target], learning_rate
+        )
+
+        return actor_loss, critic_loss, advantage
+
     def save(self, filepath):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         self.saver.save(self.sess, filepath)
@@ -253,122 +263,6 @@ class SimpleAgent:
     def load(self, filepath):
         self.saver.restore(self.sess, filepath)
 
-
-class RolloutBuffer:
-    """用于按批量整理轨迹并执行多次优化的缓冲区"""
-
-    def __init__(self, gamma, gae_lambda=0.95, batch_size=512, mini_batch=128, update_epochs=4):
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.batch_size = batch_size
-        self.mini_batch = mini_batch
-        self.update_epochs = update_epochs
-
-        self.clear()
-
-    def clear(self):
-        self.states = []
-        self.actions = []
-        self.advantages = []
-        self.returns = []
-        self.total_steps = 0
-
-    @staticmethod
-    def _clone_state(state):
-        return {
-            'self_state': np.array(state['self_state'], copy=True),
-            'goal_state': np.array(state['goal_state'], copy=True),
-            'obstacle_states': np.array(state['obstacle_states'], copy=True)
-        }
-
-    def store_episode(self, states, actions, rewards, next_states, dones, agent):
-        if not states:
-            return
-
-        cloned_states = [self._clone_state(s) for s in states]
-        cloned_next_states = [self._clone_state(ns) for ns in next_states]
-
-        values = agent.evaluate_values(cloned_states)
-        next_values = agent.evaluate_values(cloned_next_states)
-
-        rewards = np.array(rewards, dtype=np.float32)
-        dones_array = np.array(dones, dtype=np.float32)
-        next_values = next_values * (1.0 - dones_array)
-
-        advantages = []
-        gae = 0.0
-
-        for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * next_values[t] - values[t]
-            gae = delta + self.gamma * self.gae_lambda * (1.0 - dones_array[t]) * gae
-            advantages.insert(0, gae)
-
-        advantages = np.array(advantages, dtype=np.float32)
-        returns = advantages + values
-
-        self.states.extend(cloned_states)
-        self.actions.extend(actions)
-        self.advantages.extend(advantages)
-        self.returns.extend(returns)
-        self.total_steps += len(cloned_states)
-
-    def ready(self):
-        return len(self.states) >= self.batch_size
-
-    def has_data(self):
-        return len(self.states) > 0
-
-    def update(self, agent, learning_rate):
-        if not self.states:
-            return None
-
-        actions = np.array(self.actions, dtype=np.int32)
-        advantages = np.array(self.advantages, dtype=np.float32)
-        returns = np.array(self.returns, dtype=np.float32)
-
-        if len(advantages) > 1:
-            adv_mean = advantages.mean()
-            adv_std = advantages.std()
-            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-
-        indices = np.arange(len(self.states))
-        total_actor_loss = 0.0
-        total_critic_loss = 0.0
-        total_batches = 0
-
-        for _ in range(self.update_epochs):
-            np.random.shuffle(indices)
-            for start in range(0, len(indices), self.mini_batch):
-                end = start + self.mini_batch
-                batch_idx = indices[start:end]
-
-                batch_states = [self.states[i] for i in batch_idx]
-                batch_actions = actions[batch_idx]
-                batch_advantages = advantages[batch_idx]
-                batch_returns = returns[batch_idx]
-
-                actor_loss, critic_loss = agent.train_step(
-                    batch_states,
-                    batch_actions,
-                    batch_advantages,
-                    batch_returns,
-                    learning_rate
-                )
-
-                total_actor_loss += actor_loss
-                total_critic_loss += critic_loss
-                total_batches += 1
-
-        info = {
-            'num_samples': len(self.states),
-            'actor_loss': total_actor_loss / max(1, total_batches),
-            'critic_loss': total_critic_loss / max(1, total_batches),
-            'epochs': self.update_epochs,
-            'batches': total_batches
-        }
-
-        self.clear()
-        return info
 
 def create_dynamic_obstacles(dynamic_type='none'):
     """创建不同难度的动态障碍物"""
@@ -438,26 +332,24 @@ def load_scenes(config, dynamic_type):
 
 
 def run_episode(lstm_env, agent, scenario, max_steps, epsilon=0.0, deterministic=False):
-    """运行一个episode"""
+    """运行一个episode并返回结果，用于评估或收集统计信息"""
     lstm_state = lstm_env.reset(scenario)
-    states, actions, rewards = [], [], []
-    next_states, dones = [], []
+
+    total_reward = 0.0
+    steps = 0
 
     for step in range(max_steps):
         action = agent.select_action(lstm_state, deterministic, epsilon)
         next_lstm_state, reward, done = lstm_env.step(action)
 
-        states.append(lstm_state)
-        actions.append(action)
-        rewards.append(reward)
-        next_states.append(next_lstm_state)
-        dones.append(done)
+        total_reward += reward
+        steps = step + 1
 
         if done:
             break
         lstm_state = next_lstm_state
 
-    return states, actions, rewards, next_states, dones, lstm_env.env.result, step + 1
+    return total_reward, lstm_env.env.result, steps
 
 
 def train_stage(config, stage_config, agent, lstm_env, global_episode):
@@ -482,18 +374,13 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
 
     reward_window = deque(maxlen=10)
     result_window = deque(maxlen=10)
+    actor_loss_window = deque(maxlen=50)
+    critic_loss_window = deque(maxlen=50)
+    td_error_window = deque(maxlen=50)
 
     best_success = 0.0
     episodes_completed = 0
     attempt = 0
-
-    buffer = RolloutBuffer(
-        gamma=config.gamma,
-        gae_lambda=stage_config.get('gae_lambda', 0.95),
-        batch_size=stage_config.get('batch_size', 512),
-        mini_batch=stage_config.get('mini_batch', 128),
-        update_epochs=stage_config.get('update_epochs', 4)
-    )
 
     while True:
         if attempt == 0:
@@ -512,27 +399,40 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
             decay_progress = min(episodes_completed / decay_steps, 1.0)
             epsilon = max(0.05, 1.0 - decay_progress)
 
-            # 运行episode
-            states, actions, rewards, next_states, dones, result, num_steps = run_episode(
-                lstm_env, agent, scenario, config.max_steps, epsilon
-            )
+            lstm_state = lstm_env.reset(scenario)
+            episode_reward = 0.0
+            actor_losses = []
+            critic_losses = []
+            td_errors = []
 
-            if len(states) == 0:
-                continue
+            for _ in range(config.max_steps):
+                action = agent.select_action(lstm_state, deterministic=False, epsilon=epsilon)
+                next_state, reward, done = lstm_env.step(action)
 
-            buffer.store_episode(states, actions, rewards, next_states, dones, agent)
+                actor_loss, critic_loss, td_error = agent.td_update(
+                    lstm_state, action, reward, next_state, done,
+                    stage_config['learning_rate'], config.gamma
+                )
 
-            reward_window.append(np.sum(rewards))
+                episode_reward += reward
+                actor_losses.append(actor_loss)
+                critic_losses.append(critic_loss)
+                td_errors.append(td_error)
+
+                if done:
+                    break
+
+                lstm_state = next_state
+
+            result = lstm_env.env.result
+
+            reward_window.append(episode_reward)
             result_window.append(result)
 
-            if buffer.ready():
-                update_info = buffer.update(agent, stage_config['learning_rate'])
-                if update_info is not None:
-                    print(
-                        f"  🔁 批量更新: 样本{update_info['num_samples']} | "
-                        f"actor_loss:{update_info['actor_loss']:.4f} | "
-                        f"critic_loss:{update_info['critic_loss']:.4f}"
-                    )
+            if actor_losses:
+                actor_loss_window.append(np.mean(actor_losses))
+                critic_loss_window.append(np.mean(critic_losses))
+                td_error_window.append(np.mean(td_errors))
 
             if episodes_completed % 10 == 0:
                 recent_rewards = list(reward_window)
@@ -540,12 +440,23 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
                 success_count = sum(1 for r in recent_results if r == 3)
 
                 print(f"Episode {episodes_completed} [全局:{global_episode}] (最近10局)")
-                print(f"  奖励:{np.mean(recent_rewards):.3f} | 成功:{success_count}/{len(recent_results)} | ε:{epsilon:.3f}")
+                log_line = (
+                    f"  奖励:{np.mean(recent_rewards):.3f} | 成功:{success_count}/{len(recent_results)} | "
+                    f"ε:{epsilon:.3f}"
+                )
+                if actor_loss_window and critic_loss_window:
+                    log_line += (
+                        f" | ActorLoss:{np.mean(actor_loss_window):.4f}"
+                        f" | CriticLoss:{np.mean(critic_loss_window):.4f}"
+                    )
+                if td_error_window:
+                    log_line += f" | TD:{np.mean(td_error_window):.4f}"
+                print(log_line)
 
             if episodes_completed % eval_frequency == 0:
                 eval_results = []
                 for eval_ep in range(min(20, len(test_scenes))):
-                    _, _, _, _, _, eval_result, _ = run_episode(
+                    _, eval_result, _ = run_episode(
                         lstm_env, agent, test_scenes[eval_ep],
                         config.max_steps, deterministic=True
                     )
@@ -567,15 +478,6 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
         if attempt > max_repeats:
             print(f"⚠️ 达到最大追加次数，但最佳成功率仍为 {best_success*100:.1f}%，未达到目标 {min_success*100:.1f}%")
             break
-
-    if buffer.has_data():
-        update_info = buffer.update(agent, stage_config['learning_rate'])
-        if update_info is not None:
-            print(
-                f"  🔁 最终批量更新: 样本{update_info['num_samples']} | "
-                f"actor_loss:{update_info['actor_loss']:.4f} | "
-                f"critic_loss:{update_info['critic_loss']:.4f}"
-            )
 
     print(f"\n✓ {stage_config['name']} 完成! 最佳: {best_success*100:.1f}%\n")
     return global_episode, best_success
