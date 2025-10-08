@@ -271,6 +271,7 @@ def run_episode(lstm_env, agent, scenario, max_steps, epsilon=0.0, deterministic
     """运行一个episode"""
     lstm_state = lstm_env.reset(scenario)
     states, actions, rewards = [], [], []
+    next_states, dones = [], []
 
     for step in range(max_steps):
         action = agent.select_action(lstm_state, deterministic, epsilon)
@@ -279,12 +280,14 @@ def run_episode(lstm_env, agent, scenario, max_steps, epsilon=0.0, deterministic
         states.append(lstm_state)
         actions.append(action)
         rewards.append(reward)
+        next_states.append(next_lstm_state)
+        dones.append(done)
 
         if done:
             break
         lstm_state = next_lstm_state
 
-    return states, actions, rewards, lstm_env.env.result, step + 1
+    return states, actions, rewards, next_states, dones, lstm_env.env.result, step + 1
 
 
 def train_stage(config, stage_config, agent, lstm_env, global_episode):
@@ -311,20 +314,29 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
         epsilon = max(0.05, 1.0 - episode / (stage_config['episodes'] * 0.5))
 
         # 运行episode
-        states, actions, rewards, result, num_steps = run_episode(
+        states, actions, rewards, next_states, dones, result, num_steps = run_episode(
             lstm_env, agent, scenario, config.max_steps, epsilon
         )
 
-        # 计算回报
-        returns = []
-        running_add = 0
-        for r in reversed(rewards):
-            running_add = running_add * config.gamma + r
-            returns.insert(0, running_add)
-
-        returns = np.array(returns)
+        # 计算回报（Generalized Advantage Estimation）
         values = np.array([agent.get_value(s) for s in states])
-        advantages = returns - values
+        next_values = np.array([agent.get_value(ns) for ns in next_states])
+
+        # 终止状态的bootstrap应为0
+        next_values = next_values * (1 - np.array(dones, dtype=np.float32))
+
+        advantages = []
+        gae = 0.0
+        lambda_ = 0.95
+        gamma = config.gamma
+
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + gamma * next_values[t] - values[t]
+            gae = delta + gamma * lambda_ * (1 - dones[t]) * gae
+            advantages.insert(0, gae)
+
+        advantages = np.array(advantages)
+        returns = advantages + values
 
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -350,7 +362,7 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
         if (episode + 1) % stage_config['eval_frequency'] == 0:
             eval_results = []
             for eval_ep in range(min(20, len(test_scenes))):
-                _, _, _, result, _ = run_episode(
+                _, _, _, _, _, result, _ = run_episode(
                     lstm_env, agent, test_scenes[eval_ep],
                     config.max_steps, deterministic=True
                 )
