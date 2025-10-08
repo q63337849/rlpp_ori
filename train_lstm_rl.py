@@ -9,6 +9,7 @@ import tensorflow as tf
 import sys
 import os
 import time
+from collections import deque
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,28 +47,40 @@ class ProgressiveConfig:
                 'episodes': 500,
                 'dynamic_type': 'none',
                 'learning_rate': 0.001,
-                'eval_frequency': 20
+                'eval_frequency': 20,
+                'min_success': 0.5,
+                'extra_episodes': 120,
+                'max_repeats': 3
             },
             {
                 'name': '阶段2：简单动态',
                 'episodes': 150,
                 'dynamic_type': 'basic',
                 'learning_rate': 0.0005,
-                'eval_frequency': 20
+                'eval_frequency': 20,
+                'min_success': 0.3,
+                'extra_episodes': 80,
+                'max_repeats': 3
             },
             {
                 'name': '阶段3：复杂动态',
                 'episodes': 200,
                 'dynamic_type': 'mixed',
                 'learning_rate': 0.0003,
-                'eval_frequency': 20
+                'eval_frequency': 20,
+                'min_success': 0.2,
+                'extra_episodes': 80,
+                'max_repeats': 4
             },
             {
                 'name': '阶段4：混乱模式',
                 'episodes': 200,
                 'dynamic_type': 'chaotic',
                 'learning_rate': 0.0001,
-                'eval_frequency': 20
+                'eval_frequency': 20,
+                'min_success': 0.1,
+                'extra_episodes': 80,
+                'max_repeats': 4
             }
         ]
 
@@ -291,11 +304,11 @@ def run_episode(lstm_env, agent, scenario, max_steps, epsilon=0.0, deterministic
 
 
 def train_stage(config, stage_config, agent, lstm_env, global_episode):
-    """训练一个阶段"""
+    """训练一个阶段，必要时自动追加训练以达到目标成功率"""
     print(f"\n{'='*60}")
     print(f"🎯 {stage_config['name']}")
     print(f"{'='*60}")
-    print(f"Episodes: {stage_config['episodes']}")
+    print(f"初始Episodes: {stage_config['episodes']}")
     print(f"动态障碍物: {stage_config['dynamic_type']}")
     print(f"学习率: {stage_config['learning_rate']}")
 
@@ -304,78 +317,107 @@ def train_stage(config, stage_config, agent, lstm_env, global_episode):
     print(f"场景: {len(train_scenes)} 训练, {len(test_scenes)} 测试")
     print(f"动态障碍物数量: {len(train_scenes[0].dynamic_obstacles)}\n")
 
-    episode_rewards = []
-    episode_results = []
+    min_success = stage_config.get('min_success', 0.3)
+    extra_episodes = stage_config.get('extra_episodes', 100)
+    max_repeats = stage_config.get('max_repeats', 2)
+    eval_frequency = stage_config.get('eval_frequency', 20)
+    base_episodes = stage_config['episodes']
+
+    reward_window = deque(maxlen=10)
+    result_window = deque(maxlen=10)
+
     best_success = 0.0
+    episodes_completed = 0
+    attempt = 0
 
-    for episode in range(stage_config['episodes']):
-        global_episode += 1
-        scenario = np.random.choice(train_scenes)
-        epsilon = max(0.05, 1.0 - episode / (stage_config['episodes'] * 0.5))
+    while True:
+        if attempt == 0:
+            episodes_this_round = base_episodes
+        else:
+            episodes_this_round = extra_episodes
+            print(f"🔁 追加训练第{attempt}轮：增加 {episodes_this_round} 个episodes，目标成功率 {min_success*100:.1f}%")
 
-        # 运行episode
-        states, actions, rewards, next_states, dones, result, num_steps = run_episode(
-            lstm_env, agent, scenario, config.max_steps, epsilon
-        )
+        for _ in range(episodes_this_round):
+            episodes_completed += 1
+            global_episode += 1
+            scenario = np.random.choice(train_scenes)
 
-        # 计算回报（Generalized Advantage Estimation）
-        values = np.array([agent.get_value(s) for s in states])
-        next_values = np.array([agent.get_value(ns) for ns in next_states])
+            decay_steps = max(1, int(base_episodes * 0.5))
+            decay_progress = min(episodes_completed / decay_steps, 1.0)
+            epsilon = max(0.05, 1.0 - decay_progress)
 
-        # 终止状态的bootstrap应为0
-        next_values = next_values * (1 - np.array(dones, dtype=np.float32))
+            # 运行episode
+            states, actions, rewards, next_states, dones, result, num_steps = run_episode(
+                lstm_env, agent, scenario, config.max_steps, epsilon
+            )
 
-        advantages = []
-        gae = 0.0
-        lambda_ = 0.95
-        gamma = config.gamma
+            if len(states) == 0:
+                continue
 
-        for t in reversed(range(len(rewards))):
-            delta = rewards[t] + gamma * next_values[t] - values[t]
-            gae = delta + gamma * lambda_ * (1 - dones[t]) * gae
-            advantages.insert(0, gae)
+            # 计算回报（Generalized Advantage Estimation）
+            values = np.array([agent.get_value(s) for s in states])
+            next_values = np.array([agent.get_value(ns) for ns in next_states])
 
-        advantages = np.array(advantages)
-        returns = advantages + values
+            dones_array = np.array(dones, dtype=np.float32)
+            next_values = next_values * (1 - dones_array)
 
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages = []
+            gae = 0.0
+            lambda_ = 0.95
+            gamma = config.gamma
 
-        # 训练
-        actor_loss, critic_loss = agent.train_step(
-            states, actions, advantages, returns, stage_config['learning_rate']
-        )
+            for t in reversed(range(len(rewards))):
+                delta = rewards[t] + gamma * next_values[t] - values[t]
+                gae = delta + gamma * lambda_ * (1 - dones_array[t]) * gae
+                advantages.insert(0, gae)
 
-        episode_rewards.append(np.sum(rewards))
-        episode_results.append(result)
+            advantages = np.array(advantages)
+            returns = advantages + values
 
-        # 打印
-        if (episode + 1) % 10 == 0:
-            recent_rewards = episode_rewards[-10:]
-            recent_results = episode_results[-10:]
-            success_count = sum(1 for r in recent_results if r == 3)
+            if len(advantages) > 1:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            print(f"Episode {episode+1}/{stage_config['episodes']} [全局:{global_episode}]")
-            print(f"  奖励:{np.mean(recent_rewards):.3f} | 成功:{success_count}/10 | ε:{epsilon:.3f}")
+            # 训练
+            agent.train_step(
+                states, actions, advantages, returns, stage_config['learning_rate']
+            )
 
-        # 评估
-        if (episode + 1) % stage_config['eval_frequency'] == 0:
-            eval_results = []
-            for eval_ep in range(min(20, len(test_scenes))):
-                _, _, _, _, _, result, _ = run_episode(
-                    lstm_env, agent, test_scenes[eval_ep],
-                    config.max_steps, deterministic=True
-                )
-                eval_results.append(result)
+            reward_window.append(np.sum(rewards))
+            result_window.append(result)
 
-            success_count = sum(1 for r in eval_results if r == 3)
-            success_rate = success_count / len(eval_results)
+            if episodes_completed % 10 == 0:
+                recent_rewards = list(reward_window)
+                recent_results = list(result_window)
+                success_count = sum(1 for r in recent_results if r == 3)
 
-            print(f"\n  📊 评估: {success_count}/{len(eval_results)} = {success_rate*100:.1f}%")
+                print(f"Episode {episodes_completed} [全局:{global_episode}] (最近10局)")
+                print(f"  奖励:{np.mean(recent_rewards):.3f} | 成功:{success_count}/{len(recent_results)} | ε:{epsilon:.3f}")
 
-            if success_rate > best_success:
-                best_success = success_rate
-                print(f"  🏆 新最佳: {best_success*100:.1f}%\n")
+            if episodes_completed % eval_frequency == 0:
+                eval_results = []
+                for eval_ep in range(min(20, len(test_scenes))):
+                    _, _, _, _, _, eval_result, _ = run_episode(
+                        lstm_env, agent, test_scenes[eval_ep],
+                        config.max_steps, deterministic=True
+                    )
+                    eval_results.append(eval_result)
+
+                success_count = sum(1 for r in eval_results if r == 3)
+                success_rate = success_count / len(eval_results)
+
+                print(f"\n  📊 评估: {success_count}/{len(eval_results)} = {success_rate*100:.1f}%")
+
+                if success_rate > best_success:
+                    best_success = success_rate
+                    print(f"  🏆 新最佳: {best_success*100:.1f}%\n")
+
+        if best_success >= min_success:
+            break
+
+        attempt += 1
+        if attempt > max_repeats:
+            print(f"⚠️ 达到最大追加次数，但最佳成功率仍为 {best_success*100:.1f}%，未达到目标 {min_success*100:.1f}%")
+            break
 
     print(f"\n✓ {stage_config['name']} 完成! 最佳: {best_success*100:.1f}%\n")
     return global_episode, best_success
