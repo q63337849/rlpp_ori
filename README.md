@@ -1,2 +1,0 @@
-# rlpp_ori
-ori
